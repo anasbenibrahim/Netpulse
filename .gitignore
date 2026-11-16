@@ -1,0 +1,33 @@
+# Java
+target/
+*.class
+*.jar
+
+# Node
+node_modules/
+.next/
+dist/
+
+# IDE
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# ESP32
+.pio/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# AI
+models/
