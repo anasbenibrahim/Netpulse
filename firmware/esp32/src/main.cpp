@@ -2,6 +2,9 @@
 #include <WiFi.h>
 #include <ESP32Ping.h>
 #include <PubSubClient.h>
+#include <Preferences.h>
+#include <ArduinoJson.h>
+#include <vector>
 #include "secrets.h"
 
 // ==========================================
@@ -29,11 +32,62 @@ const char* MQTT_NETWORK_TOPIC =
 const char* MQTT_STATUS_TOPIC =
     "netpulse/devices/esp32-01/status";
 
+// Commands from the dashboard (Wi-Fi scan, Wi-Fi switch) and their results
+const char* MQTT_COMMAND_TOPIC =
+    "netpulse/devices/esp32-01/command";
+
+const char* MQTT_COMMAND_RESULT_TOPIC =
+    "netpulse/devices/esp32-01/command-result";
+
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
 
 unsigned long lastMqttReconnectAttempt = 0;
 const unsigned long MQTT_RECONNECT_INTERVAL = 5000;
+
+// ==========================================
+// WIFI CREDENTIALS (saved in flash)
+// ==========================================
+// The network chosen from the dashboard is saved in flash (Preferences / NVS)
+// and survives reboots. secrets.h only provides the default network, used on
+// first boot and as a fallback when the saved network is not available.
+
+Preferences preferences;
+
+String wifiSsid = WIFI_SSID;
+String wifiPassword = WIFI_PASSWORD;
+
+const unsigned long WIFI_CONNECT_TIMEOUT = 15000;
+const unsigned long MQTT_CONNECT_TIMEOUT = 15000;
+
+// ==========================================
+// REMOTE COMMANDS STATE
+// ==========================================
+// The MQTT callback only records the command; it is executed from loop(),
+// because a Wi-Fi switch disconnects the MQTT client that runs the callback.
+
+enum PendingAction { ACTION_NONE, ACTION_SCAN, ACTION_CONNECT_WIFI };
+
+PendingAction pendingAction = ACTION_NONE;
+String pendingRequestId = "";
+String pendingSsid = "";
+String pendingPassword = "";
+
+// Result waiting to be published once MQTT is connected again (after a Wi-Fi switch)
+String pendingResult = "";
+
+void flushPendingResult() {
+
+    if (pendingResult.length() == 0 || !mqttClient.connected()) {
+        return;
+    }
+
+    if (mqttClient.publish(MQTT_COMMAND_RESULT_TOPIC, pendingResult.c_str())) {
+
+        Serial.println("[COMMAND] Result published");
+        pendingResult = "";
+    }
+}
 
 // ==========================================
 // NETWORK METRICS
@@ -60,29 +114,76 @@ String networkStatus = "UNKNOWN";
 // WIFI CONNECTION
 // ==========================================
 
+bool tryConnectWiFi(const String& ssid, const String& password, unsigned long timeoutMs) {
+
+    Serial.print("[WIFI] Connecting to ");
+    Serial.println(ssid);
+
+    WiFi.disconnect();
+    delay(100);
+    WiFi.begin(ssid.c_str(), password.c_str());
+
+    unsigned long start = millis();
+
+    while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
+
+        delay(500);
+        Serial.print(".");
+    }
+
+    Serial.println();
+
+    return WiFi.status() == WL_CONNECTED;
+}
+
+void loadWiFiCredentials() {
+
+    preferences.begin("netpulse", true);
+    wifiSsid = preferences.getString("ssid", WIFI_SSID);
+    wifiPassword = preferences.getString("pass", WIFI_PASSWORD);
+    preferences.end();
+}
+
+void saveWiFiCredentials(const String& ssid, const String& password) {
+
+    preferences.begin("netpulse", false);
+    preferences.putString("ssid", ssid);
+    preferences.putString("pass", password);
+    preferences.end();
+}
+
 void connectToWiFi() {
 
     Serial.println();
     Serial.println("========== NETPULSE WIFI CONNECTION ==========");
 
     WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-    int attempts = 0;
+    // NetPulse stores the credentials itself (Preferences), not the Wi-Fi driver
+    WiFi.persistent(false);
 
-    while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    loadWiFiCredentials();
 
-        delay(500);
-        Serial.print(".");
+    bool connected = tryConnectWiFi(wifiSsid, wifiPassword, WIFI_CONNECT_TIMEOUT);
 
-        attempts++;
+    if (!connected && wifiSsid != WIFI_SSID) {
+
+        Serial.println("[WIFI] Saved network unavailable, falling back to the default network");
+
+        connected = tryConnectWiFi(WIFI_SSID, WIFI_PASSWORD, WIFI_CONNECT_TIMEOUT);
+
+        if (connected) {
+            wifiSsid = WIFI_SSID;
+            wifiPassword = WIFI_PASSWORD;
+        }
     }
 
-    Serial.println();
-
-    if (WiFi.status() == WL_CONNECTED) {
+    if (connected) {
 
         Serial.println("[SUCCESS] WiFi connected!");
+
+        Serial.print("SSID: ");
+        Serial.println(WiFi.SSID());
 
         Serial.print("IP Address: ");
         Serial.println(WiFi.localIP());
@@ -133,7 +234,7 @@ void checkWiFiConnection() {
             Serial.println("[INFO] Reconnecting WiFi...");
 
             WiFi.disconnect();
-            WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+            WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
         }
     }
 }
@@ -609,6 +710,8 @@ void calculateNetworkHealthScore() {
 // MQTT CONNECTION
 // ==========================================
 
+bool connectMqttNow();
+
 void connectToMQTT() {
 
     if (WiFi.status() != WL_CONNECTED) {
@@ -625,6 +728,11 @@ void connectToMQTT() {
     }
 
     lastMqttReconnectAttempt = millis();
+
+    connectMqttNow();
+}
+
+bool connectMqttNow() {
 
     Serial.println();
     Serial.println("[MQTT] Connecting to broker...");
@@ -647,16 +755,50 @@ void connectToMQTT() {
             true
         );
 
+        // Clean session: the subscription must be renewed on every connection
+        mqttClient.subscribe(MQTT_COMMAND_TOPIC, 1);
+
+        flushPendingResult();
+
     } else {
 
         Serial.print("[MQTT] Connection failed. State: ");
         Serial.println(mqttClient.state());
     }
+
+    return connected;
+}
+
+bool connectMqttWithin(unsigned long timeoutMs) {
+
+    unsigned long start = millis();
+
+    while (millis() - start < timeoutMs) {
+
+        if (connectMqttNow()) {
+            return true;
+        }
+
+        delay(1000);
+    }
+
+    return false;
 }
 
 // ==========================================
 // MQTT JSON HELPERS
 // ==========================================
+
+String jsonString(const String& value) {
+
+    JsonDocument doc;
+    doc.set(value);
+
+    String out;
+    serializeJson(doc, out);
+
+    return out;
+}
 
 String jsonFloat(float value, bool available) {
 
@@ -714,9 +856,10 @@ void publishTelemetry() {
     payload += String(ESP.getFlashChipSize() / 1024 / 1024);
     payload += ",";
 
-    payload += "\"ssid\":\"";
-    payload += WiFi.status() == WL_CONNECTED ? WiFi.SSID() : "";
-    payload += "\",";
+    // Any Wi-Fi name can now be joined from the dashboard, so it must be JSON-escaped
+    payload += "\"ssid\":";
+    payload += jsonString(WiFi.status() == WL_CONNECTED ? WiFi.SSID() : "");
+    payload += ",";
 
     payload += "\"ip\":\"";
     payload += WiFi.status() == WL_CONNECTED ?
@@ -841,6 +984,257 @@ void publishAllMetrics() {
 }
 
 // ==========================================
+// REMOTE COMMANDS
+// ==========================================
+
+String buildResult(const String& requestId, const String& action, bool success, const String& message) {
+
+    JsonDocument doc;
+
+    doc["requestId"] = requestId;
+    doc["action"] = action;
+    doc["status"] = success ? "SUCCEEDED" : "FAILED";
+    doc["message"] = message;
+
+    if (success && WiFi.status() == WL_CONNECTED) {
+        doc["ssid"] = WiFi.SSID();
+        doc["ip"] = WiFi.localIP().toString();
+    }
+
+    String out;
+    serializeJson(doc, out);
+
+    return out;
+}
+
+void publishResult(const String& json) {
+
+    pendingResult = json;
+    flushPendingResult();
+}
+
+const char* securityName(wifi_auth_mode_t mode) {
+
+    switch (mode) {
+        case WIFI_AUTH_OPEN: return "OPEN";
+        case WIFI_AUTH_WEP: return "WEP";
+        case WIFI_AUTH_WPA_PSK: return "WPA";
+        case WIFI_AUTH_WPA2_PSK: return "WPA2";
+        case WIFI_AUTH_WPA_WPA2_PSK: return "WPA/WPA2";
+        case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2-Enterprise";
+        case WIFI_AUTH_WPA3_PSK: return "WPA3";
+        case WIFI_AUTH_WPA2_WPA3_PSK: return "WPA2/WPA3";
+        default: return "OTHER";
+    }
+}
+
+void handleWiFiScan(const String& requestId) {
+
+    const size_t MAX_NETWORKS = 20;
+
+    Serial.println("[COMMAND] Scanning Wi-Fi networks...");
+
+    int count = WiFi.scanNetworks();
+
+    JsonDocument doc;
+    doc["requestId"] = requestId;
+    doc["action"] = "scan";
+
+    if (count < 0) {
+
+        doc["status"] = "FAILED";
+        doc["message"] = "Wi-Fi scan failed";
+
+    } else {
+
+        JsonArray networks = doc["networks"].to<JsonArray>();
+        std::vector<bool> used(count, false);
+
+        // Strongest first, one entry per SSID, hidden networks skipped
+        while (networks.size() < MAX_NETWORKS) {
+
+            int best = -1;
+
+            for (int i = 0; i < count; i++) {
+                if (!used[i] && (best < 0 || WiFi.RSSI(i) > WiFi.RSSI(best))) {
+                    best = i;
+                }
+            }
+
+            if (best < 0) {
+                break;
+            }
+
+            used[best] = true;
+
+            String ssid = WiFi.SSID(best);
+
+            if (ssid.length() == 0) {
+                continue;
+            }
+
+            bool duplicate = false;
+
+            for (JsonObject existing : networks) {
+                if (ssid == existing["ssid"].as<const char*>()) {
+                    duplicate = true;
+                    break;
+                }
+            }
+
+            if (duplicate) {
+                continue;
+            }
+
+            JsonObject network = networks.add<JsonObject>();
+            network["ssid"] = ssid;
+            network["rssi"] = WiFi.RSSI(best);
+            network["channel"] = WiFi.channel(best);
+            network["security"] = securityName(WiFi.encryptionType(best));
+        }
+
+        doc["status"] = "SUCCEEDED";
+        doc["message"] = String(networks.size()) + " networks found";
+    }
+
+    WiFi.scanDelete();
+
+    String out;
+    serializeJson(doc, out);
+
+    Serial.print("[COMMAND] Scan done: ");
+    Serial.println(doc["message"].as<const char*>());
+
+    publishResult(out);
+}
+
+// Joins the new network and keeps it only if the MQTT broker is reachable from it.
+// Otherwise it goes back to the previous network, so the device never becomes unreachable.
+void handleWiFiSwitch(const String& requestId, const String& newSsid, const String& newPassword) {
+
+    String previousSsid = wifiSsid;
+    String previousPassword = wifiPassword;
+
+    Serial.print("[COMMAND] Switching Wi-Fi to ");
+    Serial.println(newSsid);
+
+    // Tells the backend that the coming silence is intentional
+    mqttClient.publish(MQTT_STATUS_TOPIC, "switching", true);
+    mqttClient.disconnect();
+
+    String failure = "";
+
+    if (!tryConnectWiFi(newSsid, newPassword, WIFI_CONNECT_TIMEOUT)) {
+
+        failure = "Could not join " + newSsid + " (wrong password or out of range)";
+
+    } else if (!connectMqttWithin(MQTT_CONNECT_TIMEOUT)) {
+
+        failure = "Joined " + newSsid + " but the MQTT broker is unreachable from this network";
+    }
+
+    if (failure.length() == 0) {
+
+        wifiSsid = newSsid;
+        wifiPassword = newPassword;
+        saveWiFiCredentials(newSsid, newPassword);
+
+        Serial.println("[COMMAND] Wi-Fi switch succeeded, network saved");
+
+        publishResult(buildResult(requestId, "connect_wifi", true, "Connected to " + newSsid));
+        return;
+    }
+
+    Serial.print("[COMMAND] ");
+    Serial.println(failure);
+    Serial.println("[COMMAND] Rolling back to the previous network");
+
+    mqttClient.disconnect();
+
+    // Sent as soon as MQTT is back (by connectMqttNow)
+    pendingResult = buildResult(requestId, "connect_wifi", false, failure + "; back on " + previousSsid);
+
+    if (tryConnectWiFi(previousSsid, previousPassword, WIFI_CONNECT_TIMEOUT)) {
+        connectMqttWithin(MQTT_CONNECT_TIMEOUT);
+    }
+    // Otherwise checkWiFiConnection() keeps retrying the previous network from loop()
+}
+
+void onMqttMessage(char* topic, byte* payload, unsigned int length) {
+
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, payload, length);
+
+    if (error) {
+
+        Serial.print("[COMMAND] Invalid JSON: ");
+        Serial.println(error.c_str());
+        return;
+    }
+
+    String id = doc["id"] | "";
+    String action = doc["action"] | "";
+
+    // Never print the password
+    Serial.print("[COMMAND] Received: ");
+    Serial.println(action);
+
+    if (pendingAction != ACTION_NONE) {
+
+        publishResult(buildResult(id, action, false, "Device busy with another command"));
+        return;
+    }
+
+    if (action == "scan") {
+
+        pendingAction = ACTION_SCAN;
+
+    } else if (action == "connect_wifi") {
+
+        pendingSsid = doc["ssid"] | "";
+        pendingPassword = doc["password"] | "";
+
+        if (pendingSsid.length() == 0) {
+
+            publishResult(buildResult(id, action, false, "Missing ssid"));
+            return;
+        }
+
+        pendingAction = ACTION_CONNECT_WIFI;
+
+    } else {
+
+        publishResult(buildResult(id, action, false, "Unknown action: " + action));
+        return;
+    }
+
+    pendingRequestId = id;
+}
+
+void processPendingCommand() {
+
+    if (pendingAction == ACTION_NONE) {
+        return;
+    }
+
+    PendingAction action = pendingAction;
+    String requestId = pendingRequestId;
+    String ssid = pendingSsid;
+    String password = pendingPassword;
+
+    pendingSsid = "";
+    pendingPassword = "";
+
+    if (action == ACTION_SCAN) {
+        handleWiFiScan(requestId);
+    } else {
+        handleWiFiSwitch(requestId, ssid, password);
+    }
+
+    pendingAction = ACTION_NONE;
+}
+
+// ==========================================
 // SETUP
 // ==========================================
 
@@ -854,14 +1248,18 @@ void setup() {
     Serial.println("########################################");
     Serial.println("#           NETPULSE ESP32             #");
     Serial.println("#        NETWORK MONITORING            #");
-    Serial.println("#             MQTT v1.0                #");
+    Serial.println("#             MQTT v1.1                #");
     Serial.println("########################################");
 
     connectToWiFi();
 
     mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
     mqttClient.setKeepAlive(60);
-    mqttClient.setBufferSize(1024);
+
+    // Large enough for a Wi-Fi scan result (up to 20 networks)
+    mqttClient.setBufferSize(4096);
+
+    mqttClient.setCallback(onMqttMessage);
 
     monitorHardware();
     monitorWiFi();
@@ -888,6 +1286,8 @@ void loop() {
     connectToMQTT();
 
     mqttClient.loop();
+
+    processPendingCommand();
 
     unsigned long currentTime = millis();
 
