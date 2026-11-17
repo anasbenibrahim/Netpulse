@@ -1,19 +1,42 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <ESP32Ping.h>
+#include <PubSubClient.h>
 #include "secrets.h"
 
 // ==========================================
-// NETPULSE - CONFIGURATION
+// NETPULSE CONFIGURATION
 // ==========================================
 
 const unsigned long MONITORING_INTERVAL = 5000;
-
 unsigned long lastMonitoringTime = 0;
 
+// ==========================================
+// MQTT CONFIGURATION
+// ==========================================
+
+const char* MQTT_BROKER = "192.168.1.101";
+const int MQTT_PORT = 1883;
+
+const char* MQTT_CLIENT_ID = "netpulse-esp32-01";
+
+const char* MQTT_TELEMETRY_TOPIC =
+    "netpulse/devices/esp32-01/telemetry";
+
+const char* MQTT_NETWORK_TOPIC =
+    "netpulse/devices/esp32-01/network";
+
+const char* MQTT_STATUS_TOPIC =
+    "netpulse/devices/esp32-01/status";
+
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
+
+unsigned long lastMqttReconnectAttempt = 0;
+const unsigned long MQTT_RECONNECT_INTERVAL = 5000;
 
 // ==========================================
-// NETWORK HEALTH - GLOBAL METRICS
+// NETWORK METRICS
 // ==========================================
 
 float currentRSSI = -100;
@@ -30,6 +53,8 @@ bool gatewayLatencyAvailable = false;
 bool internetMetricsAvailable = false;
 bool internetLatencyAvailable = false;
 
+float networkHealthScore = 0;
+String networkStatus = "UNKNOWN";
 
 // ==========================================
 // WIFI CONNECTION
@@ -38,9 +63,7 @@ bool internetLatencyAvailable = false;
 void connectToWiFi() {
 
     Serial.println();
-    Serial.println("==========================================");
-    Serial.println("        NETPULSE - WIFI CONNECTION");
-    Serial.println("==========================================");
+    Serial.println("========== NETPULSE WIFI CONNECTION ==========");
 
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -61,30 +84,22 @@ void connectToWiFi() {
 
         Serial.println("[SUCCESS] WiFi connected!");
 
-        Serial.print("SSID: ");
-        Serial.println(WiFi.SSID());
-
         Serial.print("IP Address: ");
         Serial.println(WiFi.localIP());
 
         Serial.print("Gateway: ");
         Serial.println(WiFi.gatewayIP());
 
-        Serial.print("Subnet Mask: ");
-        Serial.println(WiFi.subnetMask());
-
-        Serial.print("Signal Strength: ");
-        Serial.print(WiFi.RSSI());
-        Serial.println(" dBm");
+        Serial.print("RSSI: ");
+        Serial.println(WiFi.RSSI());
 
     } else {
 
         Serial.println("[ERROR] WiFi connection failed!");
     }
 
-    Serial.println("==========================================");
+    Serial.println("==============================================");
 }
-
 
 // ==========================================
 // WIFI RECONNECTION
@@ -115,14 +130,13 @@ void checkWiFiConnection() {
             lastReconnectAttempt = millis();
 
             Serial.println("[WARNING] WiFi disconnected!");
-            Serial.println("[INFO] Reconnecting...");
+            Serial.println("[INFO] Reconnecting WiFi...");
 
             WiFi.disconnect();
             WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
         }
     }
 }
-
 
 // ==========================================
 // HARDWARE MONITORING
@@ -149,12 +163,10 @@ void monitorHardware() {
     Serial.println(" seconds");
 
     Serial.print("Free Heap: ");
-    Serial.print(freeHeap);
-    Serial.println(" bytes");
+    Serial.println(freeHeap);
 
     Serial.print("Total Heap: ");
-    Serial.print(totalHeap);
-    Serial.println(" bytes");
+    Serial.println(totalHeap);
 
     Serial.print("Heap Usage: ");
     Serial.print(heapUsage, 2);
@@ -167,7 +179,6 @@ void monitorHardware() {
     Serial.println("========================================");
 }
 
-
 // ==========================================
 // WIFI MONITORING
 // ==========================================
@@ -176,8 +187,10 @@ void monitorWiFi() {
 
     if (WiFi.status() == WL_CONNECTED) {
 
+        currentRSSI = WiFi.RSSI();
+
         Serial.println();
-        Serial.println("========== WIFI TELEMETRY ==============");
+        Serial.println("========== WIFI TELEMETRY ==========");
 
         Serial.print("SSID: ");
         Serial.println(WiFi.SSID());
@@ -191,25 +204,22 @@ void monitorWiFi() {
         Serial.print("Subnet Mask: ");
         Serial.println(WiFi.subnetMask());
 
-        currentRSSI = WiFi.RSSI();
-
         Serial.print("RSSI: ");
         Serial.print(currentRSSI);
         Serial.println(" dBm");
 
-        Serial.println("========================================");
+        Serial.println("====================================");
 
     } else {
 
         currentRSSI = -100;
 
-        Serial.println("[WARNING] WiFi is not connected!");
+        Serial.println("[WARNING] WiFi disconnected!");
     }
 }
 
-
 // ==========================================
-// NETWORK DIAGNOSTICS - GATEWAY
+// GATEWAY MONITORING
 // ==========================================
 
 void collectNetworkMetrics() {
@@ -219,17 +229,13 @@ void collectNetworkMetrics() {
 
     if (WiFi.status() != WL_CONNECTED) {
 
-        Serial.println("Network Status: WIFI DISCONNECTED");
-        Serial.println("Gateway Latency: N/A");
-        Serial.println("Packet Loss: N/A");
-
         gatewayMetricsAvailable = false;
         gatewayLatencyAvailable = false;
 
         gatewayLatency = -1;
         gatewayPacketLoss = -1;
 
-        Serial.println("==================================================");
+        Serial.println("Gateway unavailable.");
 
         return;
     }
@@ -241,15 +247,12 @@ void collectNetworkMetrics() {
 
     const int PING_COUNT = 10;
 
-    int packetsSent = 0;
     int packetsReceived = 0;
     int packetsLost = 0;
 
     float totalLatency = 0;
 
     for (int i = 0; i < PING_COUNT; i++) {
-
-        packetsSent++;
 
         Serial.print("[GATEWAY PING] ");
         Serial.print(i + 1);
@@ -281,28 +284,23 @@ void collectNetworkMetrics() {
     }
 
     gatewayPacketLoss =
-        100.0f * packetsLost / packetsSent;
+        100.0f * packetsLost / PING_COUNT;
 
     gatewayMetricsAvailable = true;
 
     if (packetsReceived > 0) {
 
         gatewayLatency = totalLatency / packetsReceived;
-
         gatewayLatencyAvailable = true;
 
     } else {
 
         gatewayLatency = -1;
-
         gatewayLatencyAvailable = false;
     }
 
     Serial.println();
     Serial.println("---------- GATEWAY RESULTS ----------");
-
-    Serial.print("Packets Sent: ");
-    Serial.println(packetsSent);
 
     Serial.print("Packets Received: ");
     Serial.println(packetsReceived);
@@ -320,20 +318,16 @@ void collectNetworkMetrics() {
         Serial.print(gatewayLatency, 2);
         Serial.println(" ms");
 
-        Serial.println("Gateway Status: REACHABLE");
-
     } else {
 
-        Serial.println("Gateway Latency: N/A");
-        Serial.println("Gateway Status: UNREACHABLE");
+        Serial.println("Gateway unreachable.");
     }
 
     Serial.println("=====================================");
 }
 
-
 // ==========================================
-// INTERNET CONNECTIVITY MONITORING
+// INTERNET MONITORING
 // ==========================================
 
 void monitorInternetConnectivity() {
@@ -349,22 +343,15 @@ void monitorInternetConnectivity() {
         internetLatency = -1;
         internetPacketLoss = -1;
 
-        Serial.println("WiFi Status: DISCONNECTED");
-        Serial.println("Internet Status: UNAVAILABLE");
-
-        Serial.println("==================================================");
+        Serial.println("Internet unavailable.");
 
         return;
     }
 
-    IPAddress internetTarget(1, 1, 1, 1);
-
-    Serial.print("Target IP: ");
-    Serial.println(internetTarget);
+    IPAddress target(1, 1, 1, 1);
 
     const int PING_COUNT = 5;
 
-    int packetsSent = 0;
     int packetsReceived = 0;
     int packetsLost = 0;
 
@@ -372,14 +359,12 @@ void monitorInternetConnectivity() {
 
     for (int i = 0; i < PING_COUNT; i++) {
 
-        packetsSent++;
-
         Serial.print("[INTERNET PING] ");
         Serial.print(i + 1);
         Serial.print("/");
         Serial.println(PING_COUNT);
 
-        bool success = Ping.ping(internetTarget, 1);
+        bool success = Ping.ping(target, 1);
 
         if (success) {
 
@@ -404,15 +389,23 @@ void monitorInternetConnectivity() {
     }
 
     internetPacketLoss =
-        100.0f * packetsLost / packetsSent;
+        100.0f * packetsLost / PING_COUNT;
 
     internetMetricsAvailable = true;
 
+    if (packetsReceived > 0) {
+
+        internetLatency = totalLatency / packetsReceived;
+        internetLatencyAvailable = true;
+
+    } else {
+
+        internetLatency = -1;
+        internetLatencyAvailable = false;
+    }
+
     Serial.println();
     Serial.println("---------- INTERNET RESULTS ----------");
-
-    Serial.print("Packets Sent: ");
-    Serial.println(packetsSent);
 
     Serial.print("Packets Received: ");
     Serial.println(packetsReceived);
@@ -424,33 +417,24 @@ void monitorInternetConnectivity() {
     Serial.print(internetPacketLoss, 2);
     Serial.println(" %");
 
-    if (packetsReceived > 0) {
-
-        internetLatency = totalLatency / packetsReceived;
-
-        internetLatencyAvailable = true;
-
-        Serial.println("Internet Status: CONNECTED");
+    if (internetLatencyAvailable) {
 
         Serial.print("Average Latency: ");
         Serial.print(internetLatency, 2);
         Serial.println(" ms");
 
+        Serial.println("Internet Status: CONNECTED");
+
     } else {
 
-        internetLatency = -1;
-        internetLatencyAvailable = false;
-
         Serial.println("Internet Status: UNAVAILABLE");
-        Serial.println("Average Latency: N/A");
     }
 
     Serial.println("=====================================");
 }
 
-
 // ==========================================
-// NETWORK HEALTH - RSSI SCORE
+// NETWORK HEALTH SCORING
 // ==========================================
 
 float calculateRSSIScore(float rssi) {
@@ -466,11 +450,6 @@ float calculateRSSIScore(float rssi) {
     return 0;
 }
 
-
-// ==========================================
-// NETWORK HEALTH - LATENCY SCORE
-// ==========================================
-
 float calculateLatencyScore(float latency) {
 
     if (latency < 0) return 0;
@@ -483,11 +462,6 @@ float calculateLatencyScore(float latency) {
 
     return 0;
 }
-
-
-// ==========================================
-// NETWORK HEALTH - PACKET LOSS SCORE
-// ==========================================
 
 float calculatePacketLossScore(float loss) {
 
@@ -502,7 +476,6 @@ float calculatePacketLossScore(float loss) {
     return 0;
 }
 
-
 // ==========================================
 // NETWORK HEALTH SCORE
 // ==========================================
@@ -510,188 +483,362 @@ float calculatePacketLossScore(float loss) {
 void calculateNetworkHealthScore() {
 
     Serial.println();
-
     Serial.println("========== NETPULSE NETWORK HEALTH ==========");
 
     if (WiFi.status() != WL_CONNECTED) {
 
-        Serial.println("Network Health Score: 0/100");
-        Serial.println("Network Status: CRITICAL");
-        Serial.println("Reason: WiFi disconnected");
+        networkHealthScore = 0;
+        networkStatus = "CRITICAL";
 
-        Serial.println("=============================================");
+        Serial.println("NETWORK HEALTH SCORE: 0/100");
+        Serial.println("NETWORK STATUS: CRITICAL");
 
         return;
     }
 
     float totalScore = 0;
-
     int totalWeight = 0;
 
-    // --------------------------------------
-    // WIFI RSSI - 20%
-    // --------------------------------------
+    // RSSI: 20%
 
-    float rssiScore = calculateRSSIScore(currentRSSI);
-
-    totalScore += rssiScore * 20;
+    totalScore += calculateRSSIScore(currentRSSI) * 20;
     totalWeight += 20;
 
-    // --------------------------------------
-    // GATEWAY PACKET LOSS - 25%
-    // --------------------------------------
+    // Gateway packet loss: 25%
 
     if (gatewayMetricsAvailable) {
 
-        float score = calculatePacketLossScore(
-            gatewayPacketLoss
-        );
+        totalScore +=
+            calculatePacketLossScore(gatewayPacketLoss) * 25;
 
-        totalScore += score * 25;
         totalWeight += 25;
     }
 
-    // --------------------------------------
-    // GATEWAY LATENCY - 15%
-    // --------------------------------------
+    // Gateway latency: 15%
 
     if (gatewayLatencyAvailable) {
 
-        float score = calculateLatencyScore(
-            gatewayLatency
-        );
+        totalScore +=
+            calculateLatencyScore(gatewayLatency) * 15;
 
-        totalScore += score * 15;
         totalWeight += 15;
     }
 
-    // --------------------------------------
-    // INTERNET PACKET LOSS - 25%
-    // --------------------------------------
+    // Internet packet loss: 25%
 
     if (internetMetricsAvailable) {
 
-        float score = calculatePacketLossScore(
-            internetPacketLoss
-        );
+        totalScore +=
+            calculatePacketLossScore(internetPacketLoss) * 25;
 
-        totalScore += score * 25;
         totalWeight += 25;
     }
 
-    // --------------------------------------
-    // INTERNET LATENCY - 15%
-    // --------------------------------------
+    // Internet latency: 15%
 
     if (internetLatencyAvailable) {
 
-        float score = calculateLatencyScore(
-            internetLatency
-        );
+        totalScore +=
+            calculateLatencyScore(internetLatency) * 15;
 
-        totalScore += score * 15;
         totalWeight += 15;
     }
 
-    // --------------------------------------
-    // FINAL SCORE
-    // --------------------------------------
-
     if (totalWeight == 0) {
 
-        Serial.println("Network Health Score: UNKNOWN");
-        Serial.println("Network Status: UNKNOWN");
+        networkHealthScore = 0;
+        networkStatus = "UNKNOWN";
 
-        Serial.println("No metrics available.");
-
-        Serial.println("=============================================");
+        Serial.println("Network Health: UNKNOWN");
 
         return;
     }
 
-    float healthScore = totalScore / totalWeight;
+    networkHealthScore = totalScore / totalWeight;
 
-    Serial.println();
+    if (networkHealthScore >= 90) {
+
+        networkStatus = "EXCELLENT";
+
+    } else if (networkHealthScore >= 75) {
+
+        networkStatus = "GOOD";
+
+    } else if (networkHealthScore >= 60) {
+
+        networkStatus = "FAIR";
+
+    } else if (networkHealthScore >= 40) {
+
+        networkStatus = "POOR";
+
+    } else {
+
+        networkStatus = "CRITICAL";
+    }
 
     Serial.print("WiFi RSSI: ");
     Serial.print(currentRSSI);
     Serial.println(" dBm");
 
     Serial.print("Gateway Latency: ");
-
-    if (gatewayLatencyAvailable) {
-        Serial.print(gatewayLatency, 2);
-        Serial.println(" ms");
-    } else {
-        Serial.println("N/A");
-    }
+    Serial.println(gatewayLatency);
 
     Serial.print("Gateway Packet Loss: ");
-
-    if (gatewayMetricsAvailable) {
-        Serial.print(gatewayPacketLoss, 2);
-        Serial.println(" %");
-    } else {
-        Serial.println("N/A");
-    }
+    Serial.println(gatewayPacketLoss);
 
     Serial.print("Internet Latency: ");
-
-    if (internetLatencyAvailable) {
-        Serial.print(internetLatency, 2);
-        Serial.println(" ms");
-    } else {
-        Serial.println("N/A");
-    }
+    Serial.println(internetLatency);
 
     Serial.print("Internet Packet Loss: ");
+    Serial.println(internetPacketLoss);
 
-    if (internetMetricsAvailable) {
-        Serial.print(internetPacketLoss, 2);
-        Serial.println(" %");
-    } else {
-        Serial.println("N/A");
-    }
-
-    Serial.println();
     Serial.println("---------------------------------------------");
 
     Serial.print("NETWORK HEALTH SCORE: ");
-
-    Serial.print(healthScore, 2);
-
+    Serial.print(networkHealthScore, 2);
     Serial.println("/100");
 
-    Serial.println("---------------------------------------------");
-
-    // --------------------------------------
-    // NETWORK CLASSIFICATION
-    // --------------------------------------
-
-    if (healthScore >= 90) {
-
-        Serial.println("NETWORK STATUS: EXCELLENT");
-
-    } else if (healthScore >= 75) {
-
-        Serial.println("NETWORK STATUS: GOOD");
-
-    } else if (healthScore >= 60) {
-
-        Serial.println("NETWORK STATUS: FAIR");
-
-    } else if (healthScore >= 40) {
-
-        Serial.println("NETWORK STATUS: POOR");
-
-    } else {
-
-        Serial.println("NETWORK STATUS: CRITICAL");
-    }
+    Serial.print("NETWORK STATUS: ");
+    Serial.println(networkStatus);
 
     Serial.println("=============================================");
 }
 
+// ==========================================
+// MQTT CONNECTION
+// ==========================================
+
+void connectToMQTT() {
+
+    if (WiFi.status() != WL_CONNECTED) {
+        return;
+    }
+
+    if (mqttClient.connected()) {
+        return;
+    }
+
+    if (millis() - lastMqttReconnectAttempt <
+        MQTT_RECONNECT_INTERVAL) {
+        return;
+    }
+
+    lastMqttReconnectAttempt = millis();
+
+    Serial.println();
+    Serial.println("[MQTT] Connecting to broker...");
+
+    bool connected = mqttClient.connect(
+        MQTT_CLIENT_ID,
+        MQTT_STATUS_TOPIC,
+        1,
+        true,
+        "offline"
+    );
+
+    if (connected) {
+
+        Serial.println("[MQTT] Connected successfully!");
+
+        mqttClient.publish(
+            MQTT_STATUS_TOPIC,
+            "online",
+            true
+        );
+
+    } else {
+
+        Serial.print("[MQTT] Connection failed. State: ");
+        Serial.println(mqttClient.state());
+    }
+}
+
+// ==========================================
+// MQTT JSON HELPERS
+// ==========================================
+
+String jsonFloat(float value, bool available) {
+
+    if (!available) {
+        return "null";
+    }
+
+    return String(value, 2);
+}
+
+// ==========================================
+// MQTT TELEMETRY PUBLISH
+// ==========================================
+
+void publishTelemetry() {
+
+    if (!mqttClient.connected()) {
+        return;
+    }
+
+    uint32_t freeHeap = ESP.getFreeHeap();
+    uint32_t totalHeap = ESP.getHeapSize();
+
+    float heapUsage = 0;
+
+    if (totalHeap > 0) {
+
+        heapUsage =
+            ((float)(totalHeap - freeHeap) / totalHeap) * 100.0;
+    }
+
+    String payload;
+    payload.reserve(512);
+
+    payload = "{";
+
+    payload += "\"deviceId\":\"esp32-01\",";
+    payload += "\"uptime\":";
+    payload += String(millis() / 1000);
+    payload += ",";
+
+    payload += "\"freeHeap\":";
+    payload += String(freeHeap);
+    payload += ",";
+
+    payload += "\"totalHeap\":";
+    payload += String(totalHeap);
+    payload += ",";
+
+    payload += "\"heapUsage\":";
+    payload += String(heapUsage, 2);
+    payload += ",";
+
+    payload += "\"flashSizeMB\":";
+    payload += String(ESP.getFlashChipSize() / 1024 / 1024);
+    payload += ",";
+
+    payload += "\"ssid\":\"";
+    payload += WiFi.status() == WL_CONNECTED ? WiFi.SSID() : "";
+    payload += "\",";
+
+    payload += "\"ip\":\"";
+    payload += WiFi.status() == WL_CONNECTED ?
+        WiFi.localIP().toString() : "";
+    payload += "\",";
+
+    payload += "\"rssi\":";
+    payload += String(currentRSSI, 2);
+
+    payload += "}";
+
+    bool success = mqttClient.publish(
+        MQTT_TELEMETRY_TOPIC,
+        payload.c_str()
+    );
+
+    if (success) {
+
+        Serial.println("[MQTT] Telemetry published!");
+
+        Serial.println(payload);
+
+    } else {
+
+        Serial.println("[MQTT] Telemetry publish failed!");
+    }
+}
+
+// ==========================================
+// MQTT NETWORK PUBLISH
+// ==========================================
+
+void publishNetworkMetrics() {
+
+    if (!mqttClient.connected()) {
+        return;
+    }
+
+    String payload;
+    payload.reserve(512);
+
+    payload = "{";
+
+    payload += "\"deviceId\":\"esp32-01\",";
+
+    payload += "\"rssi\":";
+    payload += String(currentRSSI, 2);
+    payload += ",";
+
+    payload += "\"gatewayLatency\":";
+    payload += jsonFloat(
+        gatewayLatency,
+        gatewayLatencyAvailable
+    );
+    payload += ",";
+
+    payload += "\"gatewayPacketLoss\":";
+    payload += jsonFloat(
+        gatewayPacketLoss,
+        gatewayMetricsAvailable
+    );
+    payload += ",";
+
+    payload += "\"internetLatency\":";
+    payload += jsonFloat(
+        internetLatency,
+        internetLatencyAvailable
+    );
+    payload += ",";
+
+    payload += "\"internetPacketLoss\":";
+    payload += jsonFloat(
+        internetPacketLoss,
+        internetMetricsAvailable
+    );
+    payload += ",";
+
+    payload += "\"networkHealthScore\":";
+    payload += String(networkHealthScore, 2);
+    payload += ",";
+
+    payload += "\"networkStatus\":\"";
+    payload += networkStatus;
+    payload += "\"";
+
+    payload += "}";
+
+    bool success = mqttClient.publish(
+        MQTT_NETWORK_TOPIC,
+        payload.c_str()
+    );
+
+    if (success) {
+
+        Serial.println("[MQTT] Network metrics published!");
+
+        Serial.println(payload);
+
+    } else {
+
+        Serial.println("[MQTT] Network publish failed!");
+    }
+}
+
+// ==========================================
+// MQTT PUBLISH ALL
+// ==========================================
+
+void publishAllMetrics() {
+
+    if (!mqttClient.connected()) {
+
+        Serial.println("[MQTT] Broker not connected. Skipping publish.");
+
+        return;
+    }
+
+    publishTelemetry();
+    publishNetworkMetrics();
+
+    mqttClient.loop();
+}
 
 // ==========================================
 // SETUP
@@ -704,28 +851,31 @@ void setup() {
     delay(1000);
 
     Serial.println();
-
     Serial.println("########################################");
     Serial.println("#           NETPULSE ESP32             #");
     Serial.println("#        NETWORK MONITORING            #");
-    Serial.println("#        HEALTH SCORE v1.0             #");
+    Serial.println("#             MQTT v1.0                #");
     Serial.println("########################################");
 
     connectToWiFi();
 
-    monitorHardware();
+    mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+    mqttClient.setKeepAlive(60);
+    mqttClient.setBufferSize(1024);
 
+    monitorHardware();
     monitorWiFi();
 
     collectNetworkMetrics();
-
     monitorInternetConnectivity();
 
     calculateNetworkHealthScore();
 
+    connectToMQTT();
+    publishAllMetrics();
+
     lastMonitoringTime = millis();
 }
-
 
 // ==========================================
 // MAIN LOOP
@@ -734,6 +884,10 @@ void setup() {
 void loop() {
 
     checkWiFiConnection();
+
+    connectToMQTT();
+
+    mqttClient.loop();
 
     unsigned long currentTime = millis();
 
@@ -750,6 +904,8 @@ void loop() {
         monitorInternetConnectivity();
 
         calculateNetworkHealthScore();
+
+        publishAllMetrics();
     }
 
     delay(100);
