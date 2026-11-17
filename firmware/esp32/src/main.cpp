@@ -1,4 +1,105 @@
 #include <Arduino.h>
+#include <WiFi.h>
+
+const char* WIFI_SSID = "Orange-4D9B";
+const char* WIFI_PASSWORD = "MA8B41D5BGH";
+
+
+void connectToWiFi() {
+
+    Serial.println("\n========== WIFI CONNECTION ==========");
+
+    Serial.print("[INFO] Connecting to: ");
+    Serial.println(WIFI_SSID);
+
+    WiFi.mode(WIFI_STA);
+
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    unsigned long startAttempt = millis();
+
+    while (WiFi.status() != WL_CONNECTED &&
+           millis() - startAttempt < 20000) {
+
+        Serial.print(".");
+        delay(500);
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+
+        Serial.println("\n[SUCCESS] WiFi connected!");
+
+        Serial.print("SSID: ");
+        Serial.println(WiFi.SSID());
+
+        Serial.print("IP Address: ");
+        Serial.println(WiFi.localIP());
+
+        Serial.print("Signal Strength: ");
+        Serial.print(WiFi.RSSI());
+        Serial.println(" dBm");
+
+    } else {
+
+        Serial.println("\n[ERROR] WiFi connection failed!");
+    }
+
+    Serial.println("=====================================");
+}
+
+
+void collectWiFiMetrics() {
+
+    Serial.println("\n========== NETPULSE WIFI TELEMETRY ==========");
+
+    if (WiFi.status() == WL_CONNECTED) {
+
+        Serial.println("WiFi Status: CONNECTED");
+
+        Serial.print("SSID: ");
+        Serial.println(WiFi.SSID());
+
+        Serial.print("IP Address: ");
+        Serial.println(WiFi.localIP());
+
+        Serial.print("RSSI: ");
+        Serial.print(WiFi.RSSI());
+        Serial.println(" dBm");
+
+        Serial.print("Gateway: ");
+        Serial.println(WiFi.gatewayIP());
+
+        Serial.print("Subnet Mask: ");
+        Serial.println(WiFi.subnetMask());
+
+    } else {
+
+        Serial.println("WiFi Status: DISCONNECTED");
+    }
+
+    Serial.println("=============================================");
+}
+
+
+
+void checkWiFiConnection() {
+
+    static unsigned long lastReconnectAttempt = 0;
+
+    if (WiFi.status() != WL_CONNECTED) {
+
+        if (millis() - lastReconnectAttempt >= 10000) {
+
+            lastReconnectAttempt = millis();
+
+            Serial.println("[WARNING] WiFi disconnected!");
+            Serial.println("[INFO] Reconnecting...");
+
+            WiFi.disconnect();
+            WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+        }
+    }
+}
 
 // ==========================================
 // NETPULSE - ESP32 HARDWARE MONITORING
@@ -92,6 +193,7 @@ void setup() {
     Serial.println("[INFO] ESP32 initialized");
 
     displayHardwareInfo();
+    connectToWiFi();
 
     Serial.println("[INFO] Hardware monitoring started");
 }
@@ -104,10 +206,14 @@ void loop() {
 
     unsigned long currentTime = millis();
 
+    checkWiFiConnection();
+
     if (currentTime - lastMonitoringTime >= MONITORING_INTERVAL) {
 
         lastMonitoringTime = currentTime;
 
         collectMetrics();
+
+        collectWiFiMetrics();
     }
 }
