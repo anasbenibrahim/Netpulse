@@ -35,4 +35,5 @@ models/
 
 
 secrets.h
-include/secrets.hmqqt/data/
+include/secrets.h
+mqqt/data/
