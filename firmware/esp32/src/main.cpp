@@ -1180,6 +1180,9 @@ void handleWiFiSwitch(const String& requestId, const String& newSsid, const Stri
     mqttClient.publish(MQTT_STATUS_TOPIC, "switching", true);
     mqttClient.disconnect();
 
+    // The broker IP found on the old network may be wrong on the new one
+    brokerResolved = false;
+
     String failure = "";
 
     if (!tryConnectWiFi(newSsid, newPassword, WIFI_CONNECT_TIMEOUT)) {
@@ -1208,6 +1211,7 @@ void handleWiFiSwitch(const String& requestId, const String& newSsid, const Stri
     Serial.println("[COMMAND] Rolling back to the previous network");
 
     mqttClient.disconnect();
+    brokerResolved = false;
 
     // Sent as soon as MQTT is back (by connectMqttNow)
     pendingResult = buildResult(requestId, "connect_wifi", false, failure + "; back on " + previousSsid);
@@ -1317,6 +1321,12 @@ void setup() {
     }
 
     mqttClient.setKeepAlive(60);
+
+    // Bound each broker attempt (TCP connect 3 s, CONNACK 5 s instead of 15 s) so that a
+    // Wi-Fi switch and its rollback always finish well within the backend command timeout,
+    // even on a network that accepts the connection but never answers (captive portal)
+    wifiClient.setConnectionTimeout(3000);
+    mqttClient.setSocketTimeout(5);
 
     // Large enough for a Wi-Fi scan result (up to 20 networks)
     mqttClient.setBufferSize(4096);
