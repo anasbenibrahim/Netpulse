@@ -18,7 +18,7 @@ unsigned long lastMonitoringTime = 0;
 // MQTT CONFIGURATION
 // ==========================================
 
-const char* MQTT_BROKER = "192.168.1.101";
+const char* MQTT_BROKER = "192.168.1.143";
 const int MQTT_PORT = 1883;
 
 const char* MQTT_CLIENT_ID = "netpulse-esp32-01";
