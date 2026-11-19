@@ -4,8 +4,15 @@
 #include <PubSubClient.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
+#include <ESPmDNS.h>
 #include <vector>
 #include "secrets.h"
+
+// Broker address, set in secrets.h. A name ending in ".local" is resolved with
+// mDNS on every connection, so the ESP32 follows the PC when its IP or network changes.
+#ifndef MQTT_BROKER_HOST
+#define MQTT_BROKER_HOST "netpulse.local"
+#endif
 
 // ==========================================
 // NETPULSE CONFIGURATION
@@ -18,8 +25,13 @@ unsigned long lastMonitoringTime = 0;
 // MQTT CONFIGURATION
 // ==========================================
 
-const char* MQTT_BROKER = "192.168.1.143";
+const char* MQTT_BROKER = MQTT_BROKER_HOST;
 const int MQTT_PORT = 1883;
+const uint32_t MDNS_QUERY_TIMEOUT = 2000;
+
+// Resolved broker address; cleared after a failed connection so the next attempt resolves again
+IPAddress brokerIp;
+bool brokerResolved = false;
 
 const char* MQTT_CLIENT_ID = "netpulse-esp32-01";
 
@@ -732,10 +744,53 @@ void connectToMQTT() {
     connectMqttNow();
 }
 
+// Points the MQTT client at the broker: plain IP or DNS name as is, ".local" name through mDNS
+bool resolveBroker() {
+
+    String host = MQTT_BROKER;
+
+    if (!host.endsWith(".local")) {
+        mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+        return true;
+    }
+
+    if (brokerResolved) {
+        return true;
+    }
+
+    String name = host.substring(0, host.length() - 6);
+    IPAddress ip = MDNS.queryHost(name.c_str(), MDNS_QUERY_TIMEOUT);
+
+    if (ip == IPAddress(0, 0, 0, 0)) {
+
+        Serial.print("[MQTT] Cannot resolve ");
+        Serial.print(host);
+        Serial.println(" (is the PC on the same network?)");
+        return false;
+    }
+
+    brokerIp = ip;
+    brokerResolved = true;
+    mqttClient.setServer(brokerIp, MQTT_PORT);
+
+    Serial.print("[MQTT] ");
+    Serial.print(host);
+    Serial.print(" resolved to ");
+    Serial.println(brokerIp);
+
+    return true;
+}
+
 bool connectMqttNow() {
 
     Serial.println();
-    Serial.println("[MQTT] Connecting to broker...");
+    Serial.print("[MQTT] Connecting to broker ");
+    Serial.print(MQTT_BROKER);
+    Serial.println("...");
+
+    if (!resolveBroker()) {
+        return false;
+    }
 
     bool connected = mqttClient.connect(
         MQTT_CLIENT_ID,
@@ -764,6 +819,9 @@ bool connectMqttNow() {
 
         Serial.print("[MQTT] Connection failed. State: ");
         Serial.println(mqttClient.state());
+
+        // The PC may have a new IP: resolve again next time
+        brokerResolved = false;
     }
 
     return connected;
@@ -1253,7 +1311,11 @@ void setup() {
 
     connectToWiFi();
 
-    mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+    // mDNS responder, needed to resolve a ".local" broker name
+    if (!MDNS.begin("netpulse-esp32-01")) {
+        Serial.println("[MDNS] Failed to start");
+    }
+
     mqttClient.setKeepAlive(60);
 
     // Large enough for a Wi-Fi scan result (up to 20 networks)

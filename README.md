@@ -157,10 +157,17 @@ In development, Vite proxies `/api` to the backend on port 7000.
 
 ```bash
 cd firmware/esp32
-cp include/secrets.example.h include/secrets.h   # then set your default Wi-Fi
+cp include/secrets.example.h include/secrets.h   # then set your default Wi-Fi and broker
 ```
 
-Set the broker address in `src/main.cpp` (`MQTT_BROKER`, the LAN IP of the machine running Mosquitto; find it with `hostname -I`), then:
+In `include/secrets.h` (git-ignored), set:
+
+- `WIFI_SSID` / `WIFI_PASSWORD`: the default 2.4 GHz network;
+- `MQTT_BROKER_HOST`: the machine running Mosquitto, as `<hostname>.local` (run `hostname` on it).
+
+The ESP32 resolves the `.local` name with mDNS on every connection, so nothing changes when the PC gets a new IP or moves to another network, as long as the ESP32 and the PC are on the same network. Linux advertises the name through `avahi-daemon`, macOS natively, and Windows 10+ for most setups. A plain IP also works but must be updated when it changes.
+
+Then:
 
 ```bash
 pio run -t upload       # build and flash over USB
@@ -177,7 +184,7 @@ The device appears in the dashboard on its first message: there is nothing to cr
 |---|---|---|
 | `DB_URL` | `jdbc:postgresql://localhost:5432/netpulse` | Database URL |
 | `DB_USERNAME` / `DB_PASSWORD` | `netpulse_user` / `netpulse_password` | Database credentials |
-| `MQTT_BROKER_URL` | `tcp://192.168.1.101:1883` | Broker; use `tcp://localhost:1883` when Mosquitto runs on the same machine |
+| `MQTT_BROKER_URL` | `tcp://localhost:1883` | Broker; change it only when Mosquitto runs on another machine |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:5173` | Origins allowed to call the API |
 
 ### Application settings (`netpulse-backend/src/main/resources/application.properties`)
